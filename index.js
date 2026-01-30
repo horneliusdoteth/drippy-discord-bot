@@ -1,0 +1,265 @@
+/**
+ * Drippy Finance Discord Bot
+ *
+ * This bot detects when users join the server using their unique invite code,
+ * links their Discord account to their Supabase user record, and assigns the Member role.
+ *
+ * Deploy this as a separate always-on service (Railway, Fly.io, or EC2).
+ */
+
+require('dotenv').config();
+const { Client, GatewayIntentBits, Events } = require('discord.js');
+const { createClient } = require('@supabase/supabase-js');
+
+// Validate required environment variables
+const requiredEnvVars = [
+  'DISCORD_BOT_TOKEN',
+  'DISCORD_GUILD_ID',
+  'DISCORD_MEMBER_ROLE_ID',
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_KEY'
+];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
+
+// Initialize Discord client
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildInvites
+  ]
+});
+
+// Initialize Supabase client
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+const GUILD_ID = process.env.DISCORD_GUILD_ID;
+const MEMBER_ROLE_ID = process.env.DISCORD_MEMBER_ROLE_ID;
+
+// Cache invites to track which one was used when a member joins
+// Map<inviteCode, useCount>
+let inviteCache = new Map();
+
+/**
+ * Initialize invite cache when bot starts
+ */
+async function cacheInvites(guild) {
+  try {
+    const invites = await guild.invites.fetch();
+    invites.forEach(invite => {
+      inviteCache.set(invite.code, invite.uses || 0);
+    });
+    console.log(`Cached ${inviteCache.size} invites`);
+  } catch (err) {
+    console.error('Failed to cache invites:', err);
+  }
+}
+
+// Bot ready event
+client.once(Events.ClientReady, async (c) => {
+  console.log(`Discord bot ready as ${c.user.tag}`);
+
+  // Cache invites for our guild
+  const guild = c.guilds.cache.get(GUILD_ID);
+  if (guild) {
+    await cacheInvites(guild);
+  } else {
+    console.error(`Bot is not in guild ${GUILD_ID}`);
+  }
+});
+
+// Track new invites
+client.on(Events.InviteCreate, (invite) => {
+  console.log(`New invite created: ${invite.code}`);
+  inviteCache.set(invite.code, invite.uses || 0);
+});
+
+// Track deleted invites
+client.on(Events.InviteDelete, (invite) => {
+  console.log(`Invite deleted: ${invite.code}`);
+  inviteCache.delete(invite.code);
+});
+
+// Handle member joins
+client.on(Events.GuildMemberAdd, async (member) => {
+  console.log(`New member joined: ${member.user.tag} (${member.id})`);
+
+  // Ignore bots
+  if (member.user.bot) {
+    console.log('Ignoring bot user');
+    return;
+  }
+
+  // Only process for our guild
+  if (member.guild.id !== GUILD_ID) {
+    console.log(`Member joined different guild: ${member.guild.id}`);
+    return;
+  }
+
+  try {
+    // Fetch current invites to compare with cache
+    const newInvites = await member.guild.invites.fetch();
+
+    // Find which invite was used (the one with increased uses)
+    let usedInvite = null;
+    for (const [code, invite] of newInvites) {
+      const cachedUses = inviteCache.get(code) || 0;
+      if ((invite.uses || 0) > cachedUses) {
+        usedInvite = invite;
+        break;
+      }
+    }
+
+    // Update cache with new counts
+    newInvites.forEach(invite => {
+      inviteCache.set(invite.code, invite.uses || 0);
+    });
+
+    if (!usedInvite) {
+      console.log('Could not determine which invite was used');
+      // Still try to welcome them, but we can't link their account
+      await sendWelcomeDM(member, false);
+      return;
+    }
+
+    console.log(`Invite used: ${usedInvite.code}`);
+
+    // Look up user by invite code in Supabase
+    const { data: user, error: queryError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('discord_invite_code', usedInvite.code)
+      .single();
+
+    if (queryError || !user) {
+      console.log(`No user found for invite code: ${usedInvite.code}`);
+      // This might be a manual invite or old invite - let them in but don't assign role
+      await sendWelcomeDM(member, false);
+      return;
+    }
+
+    console.log(`Found user: ${user.email}`);
+
+    // Check if subscription is active
+    if (user.subscription_status !== 'active') {
+      console.log(`User ${user.email} subscription not active: ${user.subscription_status}`);
+      await member.send(
+        `Welcome to Drippy Finance!\n\n` +
+        `It looks like your subscription is not currently active (status: ${user.subscription_status}).\n` +
+        `Please contact support if you believe this is an error.`
+      ).catch(err => console.log('Could not send DM:', err.message));
+      return;
+    }
+
+    // Link Discord ID to user in Supabase
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        discord_user_id: member.id,
+        discord_joined_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', user.id);
+
+    if (updateError) {
+      console.error('Failed to update user with Discord ID:', updateError);
+    } else {
+      console.log(`Linked Discord ID ${member.id} to user ${user.email}`);
+    }
+
+    // Assign Member role
+    const role = member.guild.roles.cache.get(MEMBER_ROLE_ID);
+    if (role) {
+      await member.roles.add(role);
+      console.log(`Assigned Member role to ${member.user.tag}`);
+    } else {
+      console.error(`Member role ${MEMBER_ROLE_ID} not found`);
+    }
+
+    // Send welcome DM
+    await sendWelcomeDM(member, true, user.name);
+
+    console.log(`Successfully onboarded ${member.user.tag} (${user.email})`);
+
+  } catch (err) {
+    console.error('Error processing member join:', err);
+  }
+});
+
+/**
+ * Send a welcome DM to a new member
+ */
+async function sendWelcomeDM(member, isVerified, name = '') {
+  const firstName = name ? name.split(' ')[0] : member.user.username;
+
+  let message;
+  if (isVerified) {
+    message =
+      `Welcome to Drippy Finance, ${firstName}! 🎉\n\n` +
+      `Your subscription is active and you now have access to all member channels.\n\n` +
+      `**Getting Started:**\n` +
+      `• Check out #announcements for the latest updates\n` +
+      `• Introduce yourself in #general\n` +
+      `• Ask questions in #support if you need help\n\n` +
+      `If you have any questions, the team is here to help!`;
+  } else {
+    message =
+      `Welcome to Drippy Finance! 👋\n\n` +
+      `We couldn't automatically verify your subscription. ` +
+      `If you're a subscriber, please contact support to get your Member role.\n\n` +
+      `If you're just checking things out, feel free to look around!`;
+  }
+
+  try {
+    await member.send(message);
+    console.log(`Sent welcome DM to ${member.user.tag}`);
+  } catch (err) {
+    console.log(`Could not send DM to ${member.user.tag}:`, err.message);
+    // User might have DMs disabled - that's okay
+  }
+}
+
+// Handle member leaves (optional: log for analytics)
+client.on(Events.GuildMemberRemove, async (member) => {
+  console.log(`Member left: ${member.user.tag} (${member.id})`);
+
+  // Optionally update Supabase to clear discord_user_id
+  // This allows them to rejoin with a new invite if they resubscribe
+  try {
+    const { error } = await supabase
+      .from('users')
+      .update({
+        discord_user_id: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('discord_user_id', member.id);
+
+    if (!error) {
+      console.log(`Cleared Discord ID for departed member ${member.id}`);
+    }
+  } catch (err) {
+    console.error('Error clearing Discord ID:', err);
+  }
+});
+
+// Error handling
+client.on(Events.Error, (error) => {
+  console.error('Discord client error:', error);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled promise rejection:', error);
+});
+
+// Start the bot
+console.log('Starting Drippy Discord Bot...');
+client.login(process.env.DISCORD_BOT_TOKEN);
