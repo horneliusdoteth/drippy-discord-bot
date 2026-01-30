@@ -124,8 +124,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     });
 
     // Strategy 2: If invite tracking failed (common with single-use invites),
-    // check for recently deleted invites that match a user in our database
-    // who hasn't joined Discord yet
+    // check database for pending users who haven't joined Discord yet
     if (!usedInviteCode) {
       console.log('Invite tracking failed, checking database for pending invites...');
 
@@ -140,11 +139,21 @@ client.on(Events.GuildMemberAdd, async (member) => {
         .order('updated_at', { ascending: false })
         .limit(10);
 
+      console.log(`Found ${pendingUsers?.length || 0} pending users in database`);
+
+      if (pendingError) {
+        console.error('Database query error:', pendingError);
+      }
+
       if (!pendingError && pendingUsers && pendingUsers.length > 0) {
-        // Check if any of these invite codes were recently deleted (used)
+        // Log all pending users for debugging
+        pendingUsers.forEach(u => {
+          const inviteExists = newInvites.has(u.discord_invite_code);
+          console.log(`  - ${u.email}: invite ${u.discord_invite_code} exists=${inviteExists}`);
+        });
+
+        // Strategy 2a: First, check if any invite codes were deleted (used)
         for (const pendingUser of pendingUsers) {
-          // If the invite code is NOT in the current server invites,
-          // it was likely just used (single-use invites get deleted after use)
           const inviteStillExists = newInvites.has(pendingUser.discord_invite_code);
 
           if (!inviteStillExists) {
@@ -152,6 +161,13 @@ client.on(Events.GuildMemberAdd, async (member) => {
             usedInviteCode = pendingUser.discord_invite_code;
             break;
           }
+        }
+
+        // Strategy 2b: If no deleted invites found but there's exactly ONE pending user,
+        // assume they're the one joining (best effort for single-use invites that haven't been deleted yet)
+        if (!usedInviteCode && pendingUsers.length === 1) {
+          console.log(`Only one pending user, assuming it's them: ${pendingUsers[0].email}`);
+          usedInviteCode = pendingUsers[0].discord_invite_code;
         }
       }
     }
