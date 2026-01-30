@@ -106,15 +106,14 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 
   try {
-    // Fetch current invites to compare with cache
+    // Strategy 1: Try to find the used invite by comparing counts
     const newInvites = await member.guild.invites.fetch();
+    let usedInviteCode = null;
 
-    // Find which invite was used (the one with increased uses)
-    let usedInvite = null;
     for (const [code, invite] of newInvites) {
       const cachedUses = inviteCache.get(code) || 0;
       if ((invite.uses || 0) > cachedUses) {
-        usedInvite = invite;
+        usedInviteCode = code;
         break;
       }
     }
@@ -124,25 +123,58 @@ client.on(Events.GuildMemberAdd, async (member) => {
       inviteCache.set(invite.code, invite.uses || 0);
     });
 
-    if (!usedInvite) {
-      console.log('Could not determine which invite was used');
-      // Still try to welcome them, but we can't link their account
-      await sendWelcomeDM(member, false);
-      return;
+    // Strategy 2: If invite tracking failed (common with single-use invites),
+    // check for recently deleted invites that match a user in our database
+    // who hasn't joined Discord yet
+    if (!usedInviteCode) {
+      console.log('Invite tracking failed, checking database for pending invites...');
+
+      // Find any user with an invite code who hasn't linked their Discord yet
+      // and has an active subscription
+      const { data: pendingUsers, error: pendingError } = await supabase
+        .from('users')
+        .select('*')
+        .is('discord_user_id', null)
+        .not('discord_invite_code', 'is', null)
+        .eq('subscription_status', 'active')
+        .order('updated_at', { ascending: false })
+        .limit(10);
+
+      if (!pendingError && pendingUsers && pendingUsers.length > 0) {
+        // Check if any of these invite codes were recently deleted (used)
+        for (const pendingUser of pendingUsers) {
+          // If the invite code is NOT in the current server invites,
+          // it was likely just used (single-use invites get deleted after use)
+          const inviteStillExists = newInvites.has(pendingUser.discord_invite_code);
+
+          if (!inviteStillExists) {
+            console.log(`Found pending user with deleted invite: ${pendingUser.email} (code: ${pendingUser.discord_invite_code})`);
+            usedInviteCode = pendingUser.discord_invite_code;
+            break;
+          }
+        }
+      }
     }
 
-    console.log(`Invite used: ${usedInvite.code}`);
-
     // Look up user by invite code in Supabase
-    const { data: user, error: queryError } = await supabase
-      .from('users')
-      .select('*')
-      .eq('discord_invite_code', usedInvite.code)
-      .single();
+    let user = null;
 
-    if (queryError || !user) {
-      console.log(`No user found for invite code: ${usedInvite.code}`);
-      // This might be a manual invite or old invite - let them in but don't assign role
+    if (usedInviteCode) {
+      console.log(`Looking up invite code: ${usedInviteCode}`);
+      const { data, error: queryError } = await supabase
+        .from('users')
+        .select('*')
+        .eq('discord_invite_code', usedInviteCode)
+        .single();
+
+      if (!queryError && data) {
+        user = data;
+      }
+    }
+
+    if (!user) {
+      console.log('Could not determine which invite was used or find matching user');
+      // Still try to welcome them, but we can't link their account
       await sendWelcomeDM(member, false);
       return;
     }

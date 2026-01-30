@@ -35,7 +35,7 @@ Generate an invite URL with these permissions:
 Permission integer: `268437504`
 
 ```
-https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=268437504&scope=bot
+https://discord.com/api/oauth2/authorize?client_id=BOT_CLIENT_ID&permissions=268437536&scope=bot
 ```
 
 ### 3. Get Server IDs
