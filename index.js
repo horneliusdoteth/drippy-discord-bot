@@ -16,6 +16,7 @@ const requiredEnvVars = [
   'DISCORD_BOT_TOKEN',
   'DISCORD_GUILD_ID',
   'DISCORD_MEMBER_ROLE_ID',
+  'DISCORD_VISITOR_ROLE_ID',
   'SUPABASE_URL',
   'SUPABASE_SERVICE_KEY'
 ];
@@ -44,6 +45,7 @@ const supabase = createClient(
 
 const GUILD_ID = process.env.DISCORD_GUILD_ID;
 const MEMBER_ROLE_ID = process.env.DISCORD_MEMBER_ROLE_ID;
+const VISITOR_ROLE_ID = process.env.DISCORD_VISITOR_ROLE_ID;
 
 // Cache invites to track which one was used when a member joins
 // Map<inviteCode, useCount>
@@ -190,25 +192,19 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
     if (!user) {
       console.log('Could not determine which invite was used or find matching user');
-      // Still try to welcome them, but we can't link their account
+      // Assign Visitor role so they have basic access
+      const visitorRole = member.guild.roles.cache.get(VISITOR_ROLE_ID);
+      if (visitorRole) {
+        await member.roles.add(visitorRole);
+        console.log(`Assigned Visitor role to unverified user ${member.user.tag}`);
+      }
       await sendWelcomeDM(member, false);
       return;
     }
 
     console.log(`Found user: ${user.email}`);
 
-    // Check if subscription is active
-    if (user.subscription_status !== 'active') {
-      console.log(`User ${user.email} subscription not active: ${user.subscription_status}`);
-      await member.send(
-        `Welcome to Drippy Finance!\n\n` +
-        `It looks like your subscription is not currently active (status: ${user.subscription_status}).\n` +
-        `Please contact support if you believe this is an error.`
-      ).catch(err => console.log('Could not send DM:', err.message));
-      return;
-    }
-
-    // Link Discord ID to user in Supabase
+    // Link Discord ID to user in Supabase (always, regardless of subscription status)
     const { error: updateError } = await supabase
       .from('users')
       .update({
@@ -224,17 +220,32 @@ client.on(Events.GuildMemberAdd, async (member) => {
       console.log(`Linked Discord ID ${member.id} to user ${user.email}`);
     }
 
-    // Assign Member role
-    const role = member.guild.roles.cache.get(MEMBER_ROLE_ID);
-    if (role) {
-      await member.roles.add(role);
-      console.log(`Assigned Member role to ${member.user.tag}`);
-    } else {
-      console.error(`Member role ${MEMBER_ROLE_ID} not found`);
-    }
+    // Assign role based on subscription status
+    if (user.subscription_status === 'active') {
+      // Active subscriber — assign Member role
+      const role = member.guild.roles.cache.get(MEMBER_ROLE_ID);
+      if (role) {
+        await member.roles.add(role);
+        console.log(`Assigned Member role to ${member.user.tag}`);
+      } else {
+        console.error(`Member role ${MEMBER_ROLE_ID} not found`);
+      }
 
-    // Send welcome DM
-    await sendWelcomeDM(member, true, user.name);
+      // Send welcome DM
+      await sendWelcomeDM(member, true, user.name);
+    } else {
+      // Inactive/cancelled subscriber — assign Visitor role
+      console.log(`User ${user.email} subscription not active: ${user.subscription_status}`);
+      const visitorRole = member.guild.roles.cache.get(VISITOR_ROLE_ID);
+      if (visitorRole) {
+        await member.roles.add(visitorRole);
+        console.log(`Assigned Visitor role to ${member.user.tag}`);
+      } else {
+        console.error(`Visitor role ${VISITOR_ROLE_ID} not found`);
+      }
+
+      await sendWelcomeDM(member, false, user.name);
+    }
 
     console.log(`Successfully onboarded ${member.user.tag} (${user.email})`);
 
