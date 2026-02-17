@@ -51,6 +51,10 @@ const VISITOR_ROLE_ID = process.env.DISCORD_VISITOR_ROLE_ID;
 // Map<inviteCode, useCount>
 let inviteCache = new Map();
 
+// Track recently deleted invites (single-use invites are deleted when consumed)
+// Map<inviteCode, deletedAtTimestamp>
+let recentlyDeletedInvites = new Map();
+
 /**
  * Initialize invite cache when bot starts
  */
@@ -85,10 +89,20 @@ client.on(Events.InviteCreate, (invite) => {
   inviteCache.set(invite.code, invite.uses || 0);
 });
 
-// Track deleted invites
+// Track deleted invites — single-use invites are deleted when consumed
 client.on(Events.InviteDelete, (invite) => {
   console.log(`Invite deleted: ${invite.code}`);
   inviteCache.delete(invite.code);
+
+  // Store with timestamp so GuildMemberAdd can match it
+  recentlyDeletedInvites.set(invite.code, Date.now());
+
+  // Clean up old entries (older than 30 seconds)
+  for (const [code, timestamp] of recentlyDeletedInvites) {
+    if (Date.now() - timestamp > 30000) {
+      recentlyDeletedInvites.delete(code);
+    }
+  }
 });
 
 // Handle member joins
@@ -126,51 +140,47 @@ client.on(Events.GuildMemberAdd, async (member) => {
     });
 
     // Strategy 2: If invite tracking failed (common with single-use invites),
-    // check database for pending users who haven't joined Discord yet
+    // check recently deleted invites. When a single-use invite is consumed,
+    // Discord fires InviteDelete right before GuildMemberAdd. We match the
+    // recently deleted invite code against pending users in the database.
     if (!usedInviteCode) {
-      console.log('Invite tracking failed, checking database for pending invites...');
+      console.log('Invite count comparison failed, checking recently deleted invites...');
 
-      // Find any user with an invite code who hasn't linked their Discord yet
-      // and has an active subscription
-      const { data: pendingUsers, error: pendingError } = await supabase
-        .from('users')
-        .select('*')
-        .is('discord_user_id', null)
-        .not('discord_invite_code', 'is', null)
-        .eq('subscription_status', 'active')
-        .order('updated_at', { ascending: false })
-        .limit(10);
+      if (recentlyDeletedInvites.size > 0) {
+        console.log(`Recently deleted invites: ${[...recentlyDeletedInvites.keys()].join(', ')}`);
 
-      console.log(`Found ${pendingUsers?.length || 0} pending users in database`);
+        // Look up which recently deleted invite belongs to a pending user
+        const { data: pendingUsers, error: pendingError } = await supabase
+          .from('users')
+          .select('*')
+          .is('discord_user_id', null)
+          .not('discord_invite_code', 'is', null)
+          .eq('subscription_status', 'active')
+          .order('updated_at', { ascending: false })
+          .limit(10);
 
-      if (pendingError) {
-        console.error('Database query error:', pendingError);
-      }
+        if (pendingError) {
+          console.error('Database query error:', pendingError);
+        }
 
-      if (!pendingError && pendingUsers && pendingUsers.length > 0) {
-        // Log all pending users for debugging
-        pendingUsers.forEach(u => {
-          const inviteExists = newInvites.has(u.discord_invite_code);
-          console.log(`  - ${u.email}: invite ${u.discord_invite_code} exists=${inviteExists}`);
-        });
+        console.log(`Found ${pendingUsers?.length || 0} pending users in database`);
 
-        // Strategy 2a: First, check if any invite codes were deleted (used)
-        for (const pendingUser of pendingUsers) {
-          const inviteStillExists = newInvites.has(pendingUser.discord_invite_code);
-
-          if (!inviteStillExists) {
-            console.log(`Found pending user with deleted invite: ${pendingUser.email} (code: ${pendingUser.discord_invite_code})`);
-            usedInviteCode = pendingUser.discord_invite_code;
-            break;
+        if (!pendingError && pendingUsers) {
+          for (const pendingUser of pendingUsers) {
+            const deletedAt = recentlyDeletedInvites.get(pendingUser.discord_invite_code);
+            if (deletedAt && (Date.now() - deletedAt) < 10000) {
+              console.log(`Matched recently deleted invite ${pendingUser.discord_invite_code} to ${pendingUser.email} (deleted ${Date.now() - deletedAt}ms ago)`);
+              usedInviteCode = pendingUser.discord_invite_code;
+              // Clean up so it can't be matched again
+              recentlyDeletedInvites.delete(pendingUser.discord_invite_code);
+              break;
+            }
           }
         }
+      }
 
-        // Strategy 2b: If no deleted invites found but there's exactly ONE pending user,
-        // assume they're the one joining (best effort for single-use invites that haven't been deleted yet)
-        if (!usedInviteCode && pendingUsers.length === 1) {
-          console.log(`Only one pending user, assuming it's them: ${pendingUsers[0].email}`);
-          usedInviteCode = pendingUsers[0].discord_invite_code;
-        }
+      if (!usedInviteCode) {
+        console.log('Could not match any recently deleted invite to a pending user');
       }
     }
 
