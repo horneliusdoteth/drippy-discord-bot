@@ -139,48 +139,48 @@ client.on(Events.GuildMemberAdd, async (member) => {
       inviteCache.set(invite.code, invite.uses || 0);
     });
 
-    // Strategy 2: If invite tracking failed (common with single-use invites),
-    // check recently deleted invites. When a single-use invite is consumed,
-    // Discord fires InviteDelete right before GuildMemberAdd. We match the
-    // recently deleted invite code against pending users in the database.
+    // Strategy 2: Check for consumed single-use invites.
+    // Single-use invites disappear from the server when used, so they won't be
+    // in newInvites but WILL still be in our inviteCache. Find the difference.
     if (!usedInviteCode) {
-      console.log('Invite count comparison failed, checking recently deleted invites...');
+      const consumedCodes = [];
+      for (const [code] of inviteCache) {
+        if (!newInvites.has(code)) {
+          consumedCodes.push(code);
+        }
+      }
 
-      if (recentlyDeletedInvites.size > 0) {
-        console.log(`Recently deleted invites: ${[...recentlyDeletedInvites.keys()].join(', ')}`);
+      console.log(`Invite count comparison failed. Consumed invites (in cache but not on server): ${consumedCodes.length > 0 ? consumedCodes.join(', ') : 'none'}`);
 
-        // Look up which recently deleted invite belongs to a pending user
+      if (consumedCodes.length > 0) {
+        // Look up which consumed invite belongs to a pending user
         const { data: pendingUsers, error: pendingError } = await supabase
           .from('users')
           .select('*')
           .is('discord_user_id', null)
-          .not('discord_invite_code', 'is', null)
-          .eq('subscription_status', 'active')
-          .order('updated_at', { ascending: false })
-          .limit(10);
+          .in('discord_invite_code', consumedCodes)
+          .eq('subscription_status', 'active');
 
         if (pendingError) {
           console.error('Database query error:', pendingError);
         }
 
-        console.log(`Found ${pendingUsers?.length || 0} pending users in database`);
-
-        if (!pendingError && pendingUsers) {
-          for (const pendingUser of pendingUsers) {
-            const deletedAt = recentlyDeletedInvites.get(pendingUser.discord_invite_code);
-            if (deletedAt && (Date.now() - deletedAt) < 10000) {
-              console.log(`Matched recently deleted invite ${pendingUser.discord_invite_code} to ${pendingUser.email} (deleted ${Date.now() - deletedAt}ms ago)`);
-              usedInviteCode = pendingUser.discord_invite_code;
-              // Clean up so it can't be matched again
-              recentlyDeletedInvites.delete(pendingUser.discord_invite_code);
-              break;
-            }
-          }
+        if (!pendingError && pendingUsers && pendingUsers.length === 1) {
+          // Exact match — only one pending user matches a consumed invite
+          usedInviteCode = pendingUsers[0].discord_invite_code;
+          console.log(`Matched consumed invite ${usedInviteCode} to ${pendingUsers[0].email}`);
+        } else if (!pendingError && pendingUsers && pendingUsers.length > 1) {
+          // Multiple matches — ambiguous, can't safely determine which user joined
+          console.log(`Ambiguous: ${pendingUsers.length} pending users match consumed invites, skipping to avoid wrong match`);
+          pendingUsers.forEach(u => console.log(`  - ${u.email}: invite ${u.discord_invite_code}`));
         }
       }
 
+      // Clean up consumed invites from cache
+      consumedCodes.forEach(code => inviteCache.delete(code));
+
       if (!usedInviteCode) {
-        console.log('Could not match any recently deleted invite to a pending user');
+        console.log('Could not determine which invite was used');
       }
     }
 
