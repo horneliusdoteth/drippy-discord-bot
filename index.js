@@ -214,6 +214,17 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
     console.log(`Found user: ${user.email}`);
 
+    // Delete the invite so it can't be reused (invites are max_uses:2 for tracking purposes)
+    try {
+      const invite = newInvites.get(usedInviteCode);
+      if (invite) {
+        await invite.delete('Used by matched subscriber');
+        console.log(`Deleted invite ${usedInviteCode} after match`);
+      }
+    } catch (deleteErr) {
+      console.error(`Failed to delete invite ${usedInviteCode}:`, deleteErr.message);
+    }
+
     // Link Discord ID to user in Supabase (always, regardless of subscription status)
     const { error: updateError } = await supabase
       .from('users')
