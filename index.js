@@ -8,7 +8,7 @@
  */
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, Events } = require('discord.js');
+const { Client, GatewayIntentBits, Events, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 
 // Validate required environment variables
@@ -73,6 +73,27 @@ async function cacheInvites(guild) {
 // Bot ready event
 client.once(Events.ClientReady, async (c) => {
   console.log(`Discord bot ready as ${c.user.tag}`);
+
+  // Register slash commands
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
+  const verifyCommand = new SlashCommandBuilder()
+    .setName('verify')
+    .setDescription('Link your Discord account to your Drippy Finance subscription')
+    .addStringOption(option =>
+      option.setName('email')
+        .setDescription('The email address you used to subscribe')
+        .setRequired(true)
+    );
+
+  try {
+    await rest.put(
+      Routes.applicationGuildCommands(c.user.id, GUILD_ID),
+      { body: [verifyCommand.toJSON()] }
+    );
+    console.log('Slash commands registered');
+  } catch (err) {
+    console.error('Failed to register slash commands:', err);
+  }
 
   // Cache invites for our guild
   const guild = c.guilds.cache.get(GUILD_ID);
@@ -307,6 +328,86 @@ async function sendWelcomeDM(member, isVerified, name = '') {
     // User might have DMs disabled - that's okay
   }
 }
+
+// Handle /verify slash command
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'verify') return;
+
+  const email = interaction.options.getString('email').toLowerCase().trim();
+  const discordUserId = interaction.user.id;
+
+  // Respond ephemerally so email isn't visible to others
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    // Look up user by email
+    const { data: user, error: queryError } = await supabase
+      .from('users')
+      .select('id, email, subscription_status, discord_user_id, lifetime_access')
+      .eq('email', email)
+      .single();
+
+    if (queryError || !user) {
+      await interaction.editReply('No subscription found for that email. Make sure you use the same email you subscribed with.');
+      return;
+    }
+
+    if (user.subscription_status !== 'active' && !user.lifetime_access) {
+      await interaction.editReply('Your subscription is not currently active. Please resubscribe at https://drippy.finance/subscribe');
+      return;
+    }
+
+    if (user.discord_user_id && user.discord_user_id !== discordUserId) {
+      await interaction.editReply('That email is already linked to a different Discord account. Contact support if this is an error.');
+      return;
+    }
+
+    if (user.discord_user_id === discordUserId) {
+      // Already linked — just make sure roles are correct
+      const member = await interaction.guild.members.fetch(discordUserId);
+      if (!member.roles.cache.has(MEMBER_ROLE_ID)) {
+        await member.roles.add(MEMBER_ROLE_ID);
+        if (member.roles.cache.has(VISITOR_ROLE_ID)) {
+          await member.roles.remove(VISITOR_ROLE_ID);
+        }
+        await interaction.editReply('Your account was already linked — Member role has been restored!');
+      } else {
+        await interaction.editReply('You\'re already verified and have the Member role!');
+      }
+      return;
+    }
+
+    // Link Discord ID to user
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({
+        discord_user_id: discordUserId,
+        discord_joined_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', user.id);
+
+    if (updateError) {
+      console.error('Failed to link Discord ID:', updateError);
+      await interaction.editReply('Something went wrong linking your account. Please try again or contact support.');
+      return;
+    }
+
+    // Swap Visitor → Member role
+    const member = await interaction.guild.members.fetch(discordUserId);
+    if (member.roles.cache.has(VISITOR_ROLE_ID)) {
+      await member.roles.remove(VISITOR_ROLE_ID);
+    }
+    await member.roles.add(MEMBER_ROLE_ID);
+
+    console.log(`/verify: Linked ${email} to Discord ${discordUserId}, swapped to Member role`);
+    await interaction.editReply('You\'re verified! Member role assigned — you now have access to all member channels.');
+
+  } catch (err) {
+    console.error('/verify error:', err);
+    await interaction.editReply('Something went wrong. Please try again or contact support.');
+  }
+});
 
 // Handle member leaves (optional: log for analytics)
 client.on(Events.GuildMemberRemove, async (member) => {
