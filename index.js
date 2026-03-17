@@ -11,6 +11,11 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, Events, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 
+const maskEmail = (e) => {
+  const [local, domain] = e.split('@');
+  return `${local.slice(0, 3)}***@${domain} (${e.length} chars)`;
+};
+
 // Validate required environment variables
 const requiredEnvVars = [
   'DISCORD_BOT_TOKEN',
@@ -189,11 +194,11 @@ client.on(Events.GuildMemberAdd, async (member) => {
         if (!pendingError && pendingUsers && pendingUsers.length === 1) {
           // Exact match — only one pending user matches a consumed invite
           usedInviteCode = pendingUsers[0].discord_invite_code;
-          console.log(`Matched consumed invite ${usedInviteCode} to ${pendingUsers[0].email}`);
+          console.log(`Matched consumed invite ${usedInviteCode} to ${maskEmail(pendingUsers[0].email)}`);
         } else if (!pendingError && pendingUsers && pendingUsers.length > 1) {
           // Multiple matches — ambiguous, can't safely determine which user joined
           console.log(`Ambiguous: ${pendingUsers.length} pending users match consumed invites, skipping to avoid wrong match`);
-          pendingUsers.forEach(u => console.log(`  - ${u.email}: invite ${u.discord_invite_code}`));
+          pendingUsers.forEach(u => console.log(`  - ${maskEmail(u.email)}: invite ${u.discord_invite_code}`));
         }
       }
 
@@ -233,7 +238,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
       return;
     }
 
-    console.log(`Found user: ${user.email}`);
+    console.log(`Found user: ${maskEmail(user.email)}`);
 
     // Delete the invite so it can't be reused (invites are max_uses:2 for tracking purposes)
     try {
@@ -259,7 +264,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     if (updateError) {
       console.error('Failed to update user with Discord ID:', updateError);
     } else {
-      console.log(`Linked Discord ID ${member.id} to user ${user.email}`);
+      console.log(`Linked Discord ID ${member.id} to user ${maskEmail(user.email)}`);
     }
 
     // Assign role based on subscription status
@@ -277,7 +282,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
       await sendWelcomeDM(member, true, user.name);
     } else {
       // Inactive/cancelled subscriber — assign Visitor role
-      console.log(`User ${user.email} subscription not active: ${user.subscription_status}`);
+      console.log(`User ${maskEmail(user.email)} subscription not active: ${user.subscription_status}`);
       const visitorRole = member.guild.roles.cache.get(VISITOR_ROLE_ID);
       if (visitorRole) {
         await member.roles.add(visitorRole);
@@ -289,7 +294,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
       await sendWelcomeDM(member, false, user.name);
     }
 
-    console.log(`Successfully onboarded ${member.user.tag} (${user.email})`);
+    console.log(`Successfully onboarded ${member.user.tag} (${maskEmail(user.email)})`);
 
   } catch (err) {
     console.error('Error processing member join:', err);
@@ -400,7 +405,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     await member.roles.add(MEMBER_ROLE_ID);
 
-    console.log(`/verify: Linked ${email} to Discord ${discordUserId}, swapped to Member role`);
+    console.log(`/verify: Linked ${maskEmail(email)} to Discord ${discordUserId}, swapped to Member role`);
     await interaction.editReply('You\'re verified! Member role assigned — you now have access to all member channels.');
 
   } catch (err) {
