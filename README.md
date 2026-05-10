@@ -1,5 +1,7 @@
 # Drippy Discord Bot
 
+> Agent note: In the full Drippy workspace, read `../AGENTS.md`, `../CLAUDE/START_HERE.md`, `../CLAUDE/current-status.md`, and `../CLAUDE/doc-map.md` before using this README as implementation context. Do not read real `.env*` files.
+
 This bot handles automatic member verification when users join the Discord server using their unique invite link.
 
 ## What It Does
